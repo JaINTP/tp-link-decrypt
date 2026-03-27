@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 
 # Watchful_IP - Find RSA KEYs in TP-Link firmware and write them to include dir
-# VERSION=0.0.3
-# VDATE=03-01-25
+# VERSION=0.0.4
+# VDATE=03-27-26
 
 set -x
 set -e
+
+# Ensure ~/.local/bin is in PATH for uv-installed tools like ubi_reader and unblob
+if [ -n "$SUDO_USER" ] && [ -d "$(getent passwd "$SUDO_USER" | cut -d: -f6)/.local/bin" ]; then
+  export PATH="$(getent passwd "$SUDO_USER" | cut -d: -f6)/.local/bin:$PATH"
+fi
+export PATH="$HOME/.local/bin:$PATH"
 
 CORRECT_SHA256="0a7857d40fb02ff1b8d3cbce769e6c402a82a8094b4af553c54e4ffbdc4b6e64"
 LOG_FILE="rsa_key_extractor.log"
@@ -35,8 +41,10 @@ log_error() {
 }
 
 BINWALK=$(which binwalk)
-if [ -z "$BINWALK" ]; then
-  log_error "binwalk is not installed. Please install it and try again."
+UNBLOB=$(which unblob 2>/dev/null || command -v unblob 2>/dev/null || true)
+
+if [ -z "$BINWALK" ] && [ -z "$UNBLOB" ]; then
+  log_error "Neither binwalk nor unblob is installed. Please install at least one and try again."
 fi
 
 [ ! -d include ] && mkdir include
@@ -67,60 +75,71 @@ xxd -i DES_IV > ../include/DES_IV.h
 log_info "DES_KEY: $DES_KEY"
 log_info "DES_IV: $DES_IV"
 
-log_info "Do you want to run binwalk in quiet mode? [yes/no]"
+log_info "Do you want to run binwalk/unblob in quiet mode? [yes/no]"
 read -r QUIET_MODE
-if [[ "$QUIET_MODE" == "yes" ]]; then
 
-  log_info "Extracting ../fw/ax6000v2-up-ver1-1-2-P1[20230731-rel41066]_1024_nosign_2023-07-31_11.26.17_1693471186048.bin.rollback..."
-  if [ "$EUID" -eq 0 ]; then
-    binwalk -M -e -C 1 --run-as=root fw/ax6000v2-up-ver1-1-2-P1[20230731-rel41066]_1024_nosign_2023-07-31_11.26.17_1693471186048.bin.rollback 1>&2 2>/dev/null
-  else
-    binwalk -M -e -C 1 fw/ax6000v2-up-ver1-1-2-P1[20230731-rel41066]_1024_nosign_2023-07-31_11.26.17_1693471186048.bin.rollback 1>&2 2>/dev/null
+extract_firmware() {
+  local fw_file="$1"
+  local target_bin="$2"
+  local binwalk_opt="$3"
+  local rsa_key_var_name="$4"
+  
+  local rsa_key=""
+  
+  # Try unblob first
+  if [ -n "$UNBLOB" ]; then
+    log_info "Attempting to extract $fw_file with unblob..."
+    local unblob_dir="unblob_out_${rsa_key_var_name}"
+    mkdir -p "$unblob_dir"
+    
+    if [[ "$QUIET_MODE" == "yes" ]]; then
+      if [ "$EUID" -eq 0 ]; then
+        sudo -u "$SUDO_USER" unblob --extract-dir "$unblob_dir" "$fw_file" >/dev/null 2>&1
+      else
+        unblob --extract-dir "$unblob_dir" "$fw_file" >/dev/null 2>&1
+      fi
+    else
+      if [ "$EUID" -eq 0 ]; then
+        sudo -u "$SUDO_USER" unblob --extract-dir "$unblob_dir" "$fw_file"
+      else
+        unblob --extract-dir "$unblob_dir" "$fw_file"
+      fi
+    fi
+    
+    # Check if the target binary is found
+    rsa_key=$(find "$unblob_dir" -type f -name "$target_bin" | head -n 1 | xargs -r strings | grep BgIAAAwk || true)
   fi
-  RSAKEY_1=$(find -type f -name nvrammanager | head -n 1 | xargs strings | grep BgIAAAwk)
-  if [ -z "$RSAKEY_1" ]; then
-    log_error "Failed to extract RSAKEY_1."
+  
+  # Fallback to binwalk if unblob failed or isn't installed
+  if [ -z "$rsa_key" ] && [ -n "$BINWALK" ]; then
+    log_info "Falling back to extracting $fw_file with binwalk..."
+    if [[ "$QUIET_MODE" == "yes" ]]; then
+      if [ "$EUID" -eq 0 ]; then
+        binwalk -M -e -C "$binwalk_opt" --run-as=root "$fw_file" 1>&2 2>/dev/null
+      else
+        binwalk -M -e -C "$binwalk_opt" "$fw_file" 1>&2 2>/dev/null
+      fi
+    else
+      if [ "$EUID" -eq 0 ]; then
+        binwalk -M -e -C "$binwalk_opt" --run-as=root "$fw_file"
+      else
+        binwalk -M -e -C "$binwalk_opt" "$fw_file"
+      fi
+    fi
+    rsa_key=$(find -type f -name "$target_bin" | head -n 1 | xargs -r strings | grep BgIAAAwk || true)
   fi
+  
+  if [ -z "$rsa_key" ]; then
+    log_error "Failed to extract $rsa_key_var_name."
+  fi
+  
+  eval "$rsa_key_var_name=\"$rsa_key\""
+  log_info "$rsa_key_var_name: $rsa_key"
+}
 
-  log_info "RSAKEY_1: $RSAKEY_1"
+extract_firmware "fw/ax6000v2-up-ver1-1-2-P1[20230731-rel41066]_1024_nosign_2023-07-31_11.26.17_1693471186048.bin.rollback" "nvrammanager" "1" "RSAKEY_1"
 
-  log_info "Extracting ../fw/Tapo_C210v1_en_1.3.1_Build_221218_Rel.73283n_u_1679534600836.bin..."
-  if [ "$EUID" -eq 0 ]; then
-    binwalk -M -e -C 0 --run-as=root fw/Tapo_C210v1_en_1.3.1_Build_221218_Rel.73283n_u_1679534600836.bin 1>&2 2>/dev/null
-  else
-    binwalk -M -e -C 0 fw/Tapo_C210v1_en_1.3.1_Build_221218_Rel.73283n_u_1679534600836.bin 1>&2 2>/dev/null
-  fi
-  RSAKEY_0=$(find -type f -name slpupgrade | head -n 1 | xargs strings | grep BgIAAAwk)
-  if [ -z "$RSAKEY_0" ]; then
-    log_error "Failed to extract RSAKEY_0."
-  fi
-else
-  log_info "Extracting ../fw/ax6000v2-up-ver1-1-2-P1[20230731-rel41066]_1024_nosign_2023-07-31_11.26.17_1693471186048.bin.rollback..."
-  if [ "$EUID" -eq 0 ]; then
-    binwalk -M -e -C 1 --run-as=root fw/ax6000v2-up-ver1-1-2-P1[20230731-rel41066]_1024_nosign_2023-07-31_11.26.17_1693471186048.bin.rollback
-  else
-    binwalk -M -e -C 1 fw/ax6000v2-up-ver1-1-2-P1[20230731-rel41066]_1024_nosign_2023-07-31_11.26.17_1693471186048.bin.rollback
-  fi
-  RSAKEY_1=$(find -type f -name nvrammanager | head -n 1 | xargs strings | grep BgIAAAwk)
-  if [ -z "$RSAKEY_1" ]; then
-    log_error "Failed to extract RSAKEY_1."
-  fi
-
-  log_info "RSAKEY_1: $RSAKEY_1"
-
-  log_info "Extracting ../fw/Tapo_C210v1_en_1.3.1_Build_221218_Rel.73283n_u_1679534600836.bin..."
-  if [ "$EUID" -eq 0 ]; then
-    binwalk -M -e -C 0 --run-as=root fw/Tapo_C210v1_en_1.3.1_Build_221218_Rel.73283n_u_1679534600836.bin
-  else
-    binwalk -M -e -C 0 fw/Tapo_C210v1_en_1.3.1_Build_221218_Rel.73283n_u_1679534600836.bin
-  fi
-  RSAKEY_0=$(find -type f -name slpupgrade | head -n 1 | xargs strings | grep BgIAAAwk)
-  if [ -z "$RSAKEY_0" ]; then
-    log_error "Failed to extract RSAKEY_0."
-  fi
-fi
-
-log_info "RSAKEY_0: $RSAKEY_0"
+extract_firmware "fw/Tapo_C210v1_en_1.3.1_Build_221218_Rel.73283n_u_1679534600836.bin" "slpupgrade" "0" "RSAKEY_0"
 
 CALC_SHA256=$(echo -n "$RSAKEY_0 $RSAKEY_1" | sha256sum | awk '{print $1}')
 if [ "$CORRECT_SHA256" != "$CALC_SHA256" ]; then
